@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+import os
+import sys
+import time
+import struct
+import signal
+import threading
+import gettext
+import locale
+import syslog
+import subprocess
+
+from configobj import ConfigObj
+from validate import Validator
+
+try:
+    import dbus
+except ImportError:
+    print("Please install dbus-python: sudo apt-get install python3-dbus")
+    sys.exit(1)
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QMessageBox,
+                             QSystemTrayIcon, QMenu, QFileDialog, QHeaderView)
+from PyQt6.QtGui import QIcon, QAction, QStandardItemModel, QStandardItem
+from PyQt6.QtCore import QTimer, pyqtSignal, QObject, Qt
+from PyQt6 import uic
+
+APP_NAME = "blueproximity"
+SW_VERSION = '1.4.0-qt6'
+dist_path = os.path.dirname(os.path.realpath(__file__)) + '/'
+
+icon_base = 'blueproximity_base.svg'
+icon_att = 'blueproximity_attention.svg'
+icon_away = 'blueproximity_nocon.svg'
+icon_error = 'blueproximity_error.svg'
+icon_pause = 'blueproximity_pause.svg'
+
+conf_specs = [
+    'device_mac=string(max=17,default="")',
+    'device_channel=integer(1,30,default=7)',
+    'lock_distance=integer(0,127,default=7)',
+    'lock_duration=integer(0,120,default=6)',
+    'unlock_distance=integer(0,127,default=4)',
+    'unlock_duration=integer(0,120,default=1)',
+    'lock_command=string(default="loginctl lock-session")',
+    'unlock_command=string(default="loginctl unlock-session")',
+    'proximity_command=string(default="xset dpms force on")',
+    'proximity_interval=integer(5,600,default=60)',
+    'buffer_size=integer(1,255,default=1)',
+    'log_to_syslog=boolean(default=True)',
+    'log_syslog_facility=string(default="local7")',
+    'log_to_file=boolean(default=False)',
+    'log_filelog_filename=string(default="' + os.getenv('HOME') + '/.blueproximity/blueprox.log")'
+]
+
+class Logger:
+    def __init__(self):
+        self.syslogging = False
+        self.filelogging = False
+        self.syslog_facility = None
+        self.filename = ''
+        self.flog = None
+
+    def getFacilityFromString(self, facility):
+        log_dict = {
+            "local0": syslog.LOG_LOCAL0, "local1": syslog.LOG_LOCAL1,
+            "local2": syslog.LOG_LOCAL2, "local3": syslog.LOG_LOCAL3,
+            "local4": syslog.LOG_LOCAL4, "local5": syslog.LOG_LOCAL5,
+            "local6": syslog.LOG_LOCAL6, "local7": syslog.LOG_LOCAL7,
+            "user": syslog.LOG_USER
+        }
+        return log_dict.get(facility, syslog.LOG_USER)
+
+    def enable_syslogging(self, facility):
+        self.syslog_facility = self.getFacilityFromString(facility)
+        syslog.openlog('blueproximity', syslog.LOG_PID)
+        self.syslogging = True
+
+    def disable_syslogging(self):
+        self.syslogging = False
+
+    def enable_filelogging(self, filename):
+        self.filename = filename
+        try:
+            self.flog = open(filename, 'a')
+            self.filelogging = True
+        except:
+            self.filelogging = False
+
+    def disable_filelogging(self):
+        if self.flog:
+            try:
+                self.flog.close()
+            except: pass
+        self.filelogging = False
+
+    def log_line(self, line):
+        if self.syslogging:
+            syslog.syslog(self.syslog_facility | syslog.LOG_NOTICE, line)
+        if self.filelogging:
+            try:
+                self.flog.write(time.ctime() + " blueproximity: " + line + "\n")
+                self.flog.flush()
+            except:
+                self.disable_filelogging()
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() == 'true'
+
+    def configureFromConfig(self, config):
+        if self._as_bool(config['log_to_syslog']):
+            self.enable_syslogging(config['log_syslog_facility'])
+        else:
+            self.disable_syslogging()
+        if self._as_bool(config['log_to_file']):
+            if self.filelogging and config['log_filelog_filename'] != self.filename:
+                self.disable_filelogging()
+            if not self.filelogging:
+                self.enable_filelogging(config['log_filelog_filename'])
+        else:
+            self.disable_filelogging()
+
+class Proximity(threading.Thread):
+    def __init__(self, config):
+        threading.Thread.__init__(self, name="WorkerThread")
+        self.config = config
+        self.Dist = -255
+        self.State = "gone"
+        self.Simulate = False
+        self.Stop = False
+        self.dev_mac = self.config['device_mac']
+        self.dev_channel = self.config['device_channel']
+        self.ringbuffer_size = self.config['buffer_size']
+        self.ringbuffer = [-254] * self.ringbuffer_size
+        self.ringbuffer_pos = 0
+        self.gone_duration = self.config['lock_duration']
+        self.gone_limit = -self.config['lock_distance']
+        self.active_duration = self.config['unlock_duration']
+        self.active_limit = -self.config['unlock_distance']
+        self.ErrorMsg = "Initialized..."
+        self.ignoreFirstTransition = True
+        self.logger = Logger()
+        self.logger.configureFromConfig(self.config)
+        self.timeAct = 0
+        self.timeGone = 0
+        self.timeProx = 0
+        self.bus = None
+        self._adapter_path = "/org/bluez/hci0"
+        self._discovery_active = False
+        try:
+            self.bus = dbus.SystemBus()
+        except Exception as e:
+            print("Could not connect to dbus:", e)
+
+    def _find_adapter_path(self):
+        try:
+            manager = dbus.Interface(
+                self.bus.get_object("org.bluez", "/"),
+                "org.freedesktop.DBus.ObjectManager"
+            )
+            for path, ifaces in manager.GetManagedObjects().items():
+                if "org.bluez.Adapter1" in ifaces:
+                    return str(path)
+        except Exception:
+            pass
+        return "/org/bluez/hci0"
+
+    def _start_discovery(self):
+        try:
+            adapter = dbus.Interface(
+                self.bus.get_object("org.bluez", self._adapter_path),
+                "org.bluez.Adapter1"
+            )
+            adapter.StartDiscovery()
+            self._discovery_active = True
+        except dbus.exceptions.DBusException:
+            pass
+
+    def _stop_discovery(self):
+        if not self._discovery_active:
+            return
+        try:
+            adapter = dbus.Interface(
+                self.bus.get_object("org.bluez", self._adapter_path),
+                "org.bluez.Adapter1"
+            )
+            adapter.StopDiscovery()
+        except dbus.exceptions.DBusException:
+            pass
+        self._discovery_active = False
+
+    def get_proximity_once(self, dev_mac):
+        if not self.bus or not dev_mac:
+            return -255
+        try:
+            dev_path = self._adapter_path + "/dev_" + dev_mac.replace(':', '_').upper()
+            device = self.bus.get_object("org.bluez", dev_path)
+            props = dbus.Interface(device, "org.freedesktop.DBus.Properties")
+            rssi = props.Get("org.bluez.Device1", "RSSI")
+            return int(rssi)
+        except dbus.exceptions.DBusException:
+            return -255
+        except Exception:
+            return -255
+
+    def run_cycle(self, dev_mac):
+        self.ringbuffer_pos = (self.ringbuffer_pos + 1) % self.ringbuffer_size
+        self.ringbuffer[self.ringbuffer_pos] = self.get_proximity_once(dev_mac)
+        ret_val = sum(self.ringbuffer)
+        if self.ringbuffer[self.ringbuffer_pos] == -255:
+            self.ErrorMsg = "No connection found..."
+        else:
+            self.ErrorMsg = "Connected"
+        return int(ret_val / self.ringbuffer_size)
+
+    def go_active(self):
+        if self.ignoreFirstTransition:
+            self.ignoreFirstTransition = False
+        else:
+            self.logger.log_line('screen is unlocked')
+            if self.timeAct == 0:
+                self.timeAct = time.time()
+                subprocess.Popen(self.config['unlock_command'], shell=True)
+                self.timeAct = 0
+
+    def go_gone(self):
+        if self.ignoreFirstTransition:
+            self.ignoreFirstTransition = False
+        else:
+            self.logger.log_line('screen is locked')
+            if self.timeGone == 0:
+                self.timeGone = time.time()
+                subprocess.Popen(self.config['lock_command'], shell=True)
+                self.timeGone = 0
+
+    def go_proximity(self):
+        if self.timeProx == 0:
+            self.timeProx = time.time()
+            subprocess.Popen(self.config['proximity_command'], shell=True)
+            self.timeProx = 0
+
+    def run(self):
+        if self.bus:
+            self._adapter_path = self._find_adapter_path()
+            self._start_discovery()
+            self.logger.log_line(f'started. adapter={self._adapter_path} device={self.dev_mac or "not configured"}')
+        else:
+            self.logger.log_line('started. WARNING: no D-Bus connection, Bluetooth unavailable')
+
+        duration_count = 0
+        state = "gone"
+        proxiCmdCounter = 0
+        discovery_counter = 0
+        rssi_log_counter = 0
+        last_rssi = None
+
+        while not self.Stop:
+            try:
+                # Restart discovery every 2 minutes to keep RSSI fresh
+                discovery_counter += 1
+                if discovery_counter >= 120 and self.bus:
+                    discovery_counter = 0
+                    self._stop_discovery()
+                    self._start_discovery()
+
+                if self.dev_mac != "":
+                    dist = self.run_cycle(self.dev_mac)
+                else:
+                    dist = -255
+                    self.ErrorMsg = "No bluetooth device configured..."
+
+                # Log RSSI every 60 seconds, or immediately when it changes between found/not-found
+                rssi_log_counter += 1
+                device_visible = dist != -255
+                prev_visible = last_rssi is not None and last_rssi != -255
+                if device_visible != prev_visible:
+                    if device_visible:
+                        self.logger.log_line(f'device {self.dev_mac} found, RSSI={dist}')
+                    else:
+                        self.logger.log_line(f'device {self.dev_mac} lost')
+                elif rssi_log_counter >= 60:
+                    rssi_log_counter = 0
+                    if device_visible:
+                        self.logger.log_line(f'RSSI={dist} state={state}')
+                    else:
+                        self.logger.log_line(f'device not visible, state={state}')
+                last_rssi = dist
+
+                if state == "gone":
+                    if dist >= self.active_limit:
+                        duration_count += 1
+                        if duration_count >= self.active_duration:
+                            state = "active"
+                            duration_count = 0
+                            self.logger.log_line(f'state -> active (RSSI={dist})')
+                            if not self.Simulate:
+                                QTimer.singleShot(5, self.go_active)
+                    else:
+                        duration_count = 0
+                else:
+                    if dist <= self.gone_limit:
+                        duration_count += 1
+                        if duration_count >= self.gone_duration:
+                            state = "gone"
+                            proxiCmdCounter = 0
+                            duration_count = 0
+                            self.logger.log_line(f'state -> gone (RSSI={dist})')
+                            if not self.Simulate:
+                                QTimer.singleShot(5, self.go_gone)
+                    else:
+                        duration_count = 0
+                        proxiCmdCounter += 1
+
+                self.State = state
+                self.Dist = dist
+
+                if proxiCmdCounter >= int(self.config['proximity_interval']) and not self.Simulate and self.config['proximity_command']:
+                    proxiCmdCounter = 0
+                    QTimer.singleShot(5, self.go_proximity)
+
+                time.sleep(1)
+            except KeyboardInterrupt:
+                break
+
+        if self.bus:
+            self._stop_discovery()
+
+class ProximityGUI(QMainWindow):
+    def __init__(self, configs, new_config):
+        super().__init__()
+        self.configs = configs
+        self.configname = configs[0][0]
+        self.config = configs[0][1]
+        self.proxi = configs[0][2]
+
+        uic.loadUi(os.path.join(dist_path, "proximity.ui"), self)
+
+        self.minDist = -255
+        self.maxDist = 0
+        self.pauseMode = False
+        self.gone_live = False
+
+        self.setup_tray_icon()
+        self.setup_scan_view()
+        self.fillConfigCombo()
+        self.readSettings()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.updateState)
+        self.timer.start(1000)
+
+        self.gone_live = True
+
+        # Connect scan buttons
+        self.btnScan.clicked.connect(self.scanDevices)
+        self.btnSelect.clicked.connect(self.selectDevice)
+        self.btnScanChannel.clicked.connect(self.scanChannels)
+
+        # Apply button — enabled only when a device MAC is set and settings are dirty
+        self.btnApply.clicked.connect(self.applySettings)
+
+        # Connect UI signals — changes mark settings dirty but do not auto-save
+        self.comboConfig.currentTextChanged.connect(self.comboConfig_changed)
+        self.entryMAC.textChanged.connect(self._on_settings_changed)
+        self.hscaleLockDist.valueChanged.connect(self._on_settings_changed)
+        self.hscaleLockDur.valueChanged.connect(self._on_settings_changed)
+        self.hscaleUnlockDist.valueChanged.connect(self._on_settings_changed)
+        self.hscaleUnlockDur.valueChanged.connect(self._on_settings_changed)
+        self.hscaleProxi.valueChanged.connect(self._on_settings_changed)
+        self.checkSyslog.toggled.connect(self._on_settings_changed)
+        self.checkFile.toggled.connect(self._on_settings_changed)
+        self.entryFile.textChanged.connect(self._on_settings_changed)
+
+        if new_config:
+            self.show()
+
+    def setup_scan_view(self):
+        self._scan_model = QStandardItemModel(0, 2)
+        self._scan_model.setHorizontalHeaderLabels(["Device Name", "MAC Address"])
+        self.treeScanResult.setModel(self._scan_model)
+        self.treeScanResult.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.treeScanResult.setSelectionMode(self.treeScanResult.SelectionMode.SingleSelection)
+
+        self._chan_model = QStandardItemModel(0, 2)
+        self._chan_model.setHorizontalHeaderLabels(["Channel", "Service"])
+        self.treeScanChannelResult.setModel(self._chan_model)
+
+        self._scan_timer = None
+        self._scan_bus = None
+        self._scan_adapter = None
+        self._scan_polls = 0
+
+    def scanDevices(self):
+        self.btnScan.setEnabled(False)
+        self.btnScan.setText("Scanning...")
+        self._scan_model.removeRows(0, self._scan_model.rowCount())
+
+        try:
+            self._scan_bus = dbus.SystemBus()
+            manager = dbus.Interface(
+                self._scan_bus.get_object("org.bluez", "/"),
+                "org.freedesktop.DBus.ObjectManager"
+            )
+
+            # Find adapter
+            adapter_path = None
+            for path, ifaces in manager.GetManagedObjects().items():
+                if "org.bluez.Adapter1" in ifaces:
+                    adapter_path = str(path)
+                    break
+
+            if not adapter_path:
+                QMessageBox.warning(self, "Bluetooth Error", "No Bluetooth adapter found.")
+                self._reset_scan_button()
+                return
+
+            # Show already-known devices immediately
+            for path, ifaces in manager.GetManagedObjects().items():
+                if "org.bluez.Device1" in ifaces:
+                    props = ifaces["org.bluez.Device1"]
+                    name = str(props.get("Name", props.get("Alias", "Unknown")))
+                    addr = str(props.get("Address", ""))
+                    if addr:
+                        self._add_scan_result(name, addr)
+
+            # Start active discovery
+            self._scan_adapter = dbus.Interface(
+                self._scan_bus.get_object("org.bluez", adapter_path),
+                "org.bluez.Adapter1"
+            )
+            self._scan_adapter.StartDiscovery()
+            self._scan_polls = 0
+
+            self._scan_timer = QTimer(self)
+            self._scan_timer.timeout.connect(self._poll_scan)
+            self._scan_timer.start(2000)
+
+        except dbus.exceptions.DBusException as e:
+            QMessageBox.warning(self, "Bluetooth Error", f"Could not start scan:\n{e}")
+            self._reset_scan_button()
+
+    def _poll_scan(self):
+        self._scan_polls += 1
+        try:
+            manager = dbus.Interface(
+                self._scan_bus.get_object("org.bluez", "/"),
+                "org.freedesktop.DBus.ObjectManager"
+            )
+            for path, ifaces in manager.GetManagedObjects().items():
+                if "org.bluez.Device1" in ifaces:
+                    props = ifaces["org.bluez.Device1"]
+                    name = str(props.get("Name", props.get("Alias", "Unknown")))
+                    addr = str(props.get("Address", ""))
+                    if addr:
+                        self._add_scan_result(name, addr)
+        except Exception:
+            pass
+
+        if self._scan_polls >= 5:  # 10 seconds total
+            self._scan_timer.stop()
+            try:
+                self._scan_adapter.StopDiscovery()
+            except Exception:
+                pass
+            self._reset_scan_button()
+
+    def _add_scan_result(self, name, addr):
+        for row in range(self._scan_model.rowCount()):
+            if self._scan_model.item(row, 1).text() == addr:
+                if self._scan_model.item(row, 0).text() in ("Unknown", "") and name not in ("Unknown", ""):
+                    self._scan_model.item(row, 0).setText(name)
+                return
+        self._scan_model.appendRow([QStandardItem(name), QStandardItem(addr)])
+
+    def _reset_scan_button(self):
+        self.btnScan.setEnabled(True)
+        self.btnScan.setText("Scan for devices")
+
+    def selectDevice(self):
+        idx = self.treeScanResult.currentIndex()
+        if not idx.isValid():
+            return
+        addr = self._scan_model.item(idx.row(), 1).text()
+        self.entryMAC.setText(addr)
+
+    def scanChannels(self):
+        mac = self.entryMAC.text().strip()
+        if not mac:
+            QMessageBox.information(self, "Channel Scan",
+                "Enter or select a device MAC address first.")
+            return
+        try:
+            result = subprocess.run(
+                ["sdptool", "browse", "--l2cap", mac],
+                capture_output=True, text=True, timeout=15
+            )
+            self._chan_model.removeRows(0, self._chan_model.rowCount())
+            channel = None
+            service = None
+            for line in result.stdout.splitlines():
+                if line.startswith("Service Name:"):
+                    service = line.split(":", 1)[1].strip()
+                elif "Channel:" in line:
+                    channel = line.split(":", 1)[1].strip()
+                if channel and service:
+                    self._chan_model.appendRow([QStandardItem(channel), QStandardItem(service)])
+                    channel = None
+                    service = None
+            if self._chan_model.rowCount() == 0:
+                QMessageBox.information(self, "Channel Scan",
+                    "No RFCOMM channels found via sdptool.\n"
+                    "Try channel 1 (BLE) or 7 (classic SPP).")
+        except FileNotFoundError:
+            QMessageBox.information(self, "Channel Scan",
+                "sdptool not found. Install bluez-tools:\n"
+                "  sudo apt install bluez-tools")
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, "Channel Scan", "Scan timed out.")
+
+    def setup_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon(os.path.join(dist_path, icon_error)))
+
+        menu = QMenu()
+        pref_action = QAction("Preferences", self)
+        pref_action.triggered.connect(self.toggleWindow)
+        menu.addAction(pref_action)
+
+        self.pause_action = QAction("Pause", self)
+        self.pause_action.triggered.connect(self.pausePressed)
+        menu.addAction(self.pause_action)
+
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit)
+        menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.show()
+
+    def toggleWindow(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+
+    def pausePressed(self):
+        self.pauseMode = not self.pauseMode
+        if self.pauseMode:
+            self.pause_action.setText("Resume")
+            for conf in self.configs:
+                conf[2].lastMAC = conf[2].dev_mac
+                conf[2].dev_mac = ''
+                conf[2].Simulate = True
+        else:
+            self.pause_action.setText("Pause")
+            for conf in self.configs:
+                conf[2].dev_mac = getattr(conf[2], 'lastMAC', '')
+                conf[2].Simulate = False
+
+    def fillConfigCombo(self):
+        self.comboConfig.clear()
+        for conf in self.configs:
+            self.comboConfig.addItem(conf[0])
+        self.comboConfig.setCurrentText(self.configname)
+
+    def comboConfig_changed(self, text):
+        if text != self.configname and text:
+            for conf in self.configs:
+                if text == conf[0]:
+                    self.config = conf[1]
+                    self.configname = conf[0]
+                    self.proxi = conf[2]
+                    self.readSettings()
+                    break
+
+    def _on_settings_changed(self):
+        if not self.gone_live:
+            return
+        has_device = bool(self.entryMAC.text().strip())
+        self.btnApply.setEnabled(has_device)
+
+    def readSettings(self):
+        was_live = self.gone_live
+        self.gone_live = False
+        self.entryMAC.setText(self.config['device_mac'])
+        self.hscaleLockDist.setValue(int(self.config['lock_distance']))
+        self.hscaleLockDur.setValue(int(self.config['lock_duration']))
+        self.hscaleUnlockDist.setValue(int(self.config['unlock_distance']))
+        self.hscaleUnlockDur.setValue(int(self.config['unlock_duration']))
+        self.hscaleProxi.setValue(int(self.config['proximity_interval']))
+        self.checkSyslog.setChecked(self.config['log_to_syslog'] == 'True' or self.config['log_to_syslog'] is True)
+        self.checkFile.setChecked(self.config['log_to_file'] == 'True' or self.config['log_to_file'] is True)
+        self.entryFile.setText(self.config['log_filelog_filename'])
+        self.comboLock.setCurrentText(self.config['lock_command'])
+        self.comboUnlock.setCurrentText(self.config['unlock_command'])
+        self.comboProxi.setCurrentText(self.config['proximity_command'])
+        self.gone_live = was_live
+        # Reflect whether a device is already configured
+        self.btnApply.setEnabled(bool(self.config['device_mac']))
+
+    def applySettings(self):
+        self.writeSettings()
+        self.btnApply.setEnabled(False)
+
+    def writeSettings(self):
+        self.proxi.dev_mac = self.entryMAC.text()
+        self.proxi.gone_limit = -self.hscaleLockDist.value()
+        self.proxi.gone_duration = self.hscaleLockDur.value()
+        self.proxi.active_limit = -self.hscaleUnlockDist.value()
+        self.proxi.active_duration = self.hscaleUnlockDur.value()
+
+        self.config['device_mac'] = self.proxi.dev_mac
+        self.config['lock_distance'] = int(-self.proxi.gone_limit)
+        self.config['lock_duration'] = int(self.proxi.gone_duration)
+        self.config['unlock_distance'] = int(-self.proxi.active_limit)
+        self.config['unlock_duration'] = int(self.proxi.active_duration)
+        self.config['proximity_interval'] = self.hscaleProxi.value()
+        self.config['log_to_syslog'] = self.checkSyslog.isChecked()
+        self.config['log_to_file'] = self.checkFile.isChecked()
+        self.config['log_filelog_filename'] = self.entryFile.text()
+        self.config['lock_command'] = self.comboLock.currentText()
+        self.config['unlock_command'] = self.comboUnlock.currentText()
+        self.config['proximity_command'] = self.comboProxi.currentText()
+
+        self.proxi.logger.configureFromConfig(self.config)
+        self.config.write()
+
+    def updateState(self):
+        newVal = int(self.proxi.Dist)
+        if newVal > self.minDist: self.minDist = newVal
+        if newVal < self.maxDist: self.maxDist = newVal
+        self.labState.setText(f"min: {-self.minDist} max: {-self.maxDist} state: {self.proxi.State}")
+        self.hscaleAct.setValue(-newVal)
+
+        if self.pauseMode:
+            self.tray_icon.setIcon(QIcon(os.path.join(dist_path, icon_pause)))
+            self.tray_icon.setToolTip('Pause Mode - not connected')
+        else:
+            con_state = 0
+            if self.proxi.State != 'active':
+                con_state = 2
+            elif newVal < self.proxi.active_limit:
+                con_state = 1
+            icons = [icon_base, icon_att, icon_away, icon_error]
+            self.tray_icon.setIcon(QIcon(os.path.join(dist_path, icons[con_state])))
+            self.tray_icon.setToolTip(f"{self.configname}: State: {self.proxi.State}\nDist: {-newVal}\n{self.proxi.ErrorMsg}")
+
+    def quit(self):
+        for conf in self.configs:
+            conf[2].logger.log_line('stopped.')
+            conf[2].Stop = True
+        QApplication.quit()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    configs = []
+    new_config = True
+    conf_dir = os.path.join(os.getenv('HOME'), '.blueproximity')
+    if not os.path.exists(conf_dir):
+        os.mkdir(conf_dir)
+
+    vdt = Validator()
+    for filename in os.listdir(conf_dir):
+        if filename.endswith('.conf'):
+            try:
+                config = ConfigObj(os.path.join(conf_dir, filename),
+                                   {'create_empty': False, 'file_error': True, 'configspec': conf_specs})
+                config.validate(vdt, copy=True)
+                config.write()
+                configs.append([filename[:-5], config])
+                new_config = False
+            except: pass
+
+    if new_config:
+        config = ConfigObj(os.path.join(conf_dir, 'standard.conf'),
+                           {'create_empty': True, 'file_error': False, 'configspec': conf_specs})
+        config['device_mac'] = ''
+        config.validate(vdt, copy=True)
+        config.write()
+        configs.append(['standard', config])
+
+    for config in configs:
+        p = Proximity(config[1])
+        p.start()
+        config.append(p)
+
+    gui = ProximityGUI(configs, new_config)
+    sys.exit(app.exec())
