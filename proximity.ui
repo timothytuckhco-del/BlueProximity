@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>600</width>
-    <height>500</height>
+    <height>748</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -53,7 +53,7 @@
     <item>
      <widget class="QTabWidget" name="notebook1">
       <property name="currentIndex">
-       <number>0</number>
+       <number>1</number>
       </property>
       <widget class="QWidget" name="tabDevice">
        <attribute name="title">
@@ -149,7 +149,7 @@
            <number>127</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -166,7 +166,7 @@
            <number>120</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -190,7 +190,7 @@
            <number>127</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -207,7 +207,7 @@
            <number>120</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -231,7 +231,7 @@
            <number>127</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -268,6 +268,9 @@
           <property name="editable">
            <bool>true</bool>
           </property>
+          <property name="maxVisibleItems">
+           <number>25</number>
+          </property>
          </widget>
         </item>
         <item row="11" column="0">
@@ -282,6 +285,9 @@
           <property name="editable">
            <bool>true</bool>
           </property>
+          <property name="maxVisibleItems">
+           <number>25</number>
+          </property>
          </widget>
         </item>
         <item row="12" column="0">
@@ -295,6 +301,9 @@
          <widget class="QComboBox" name="comboProxi">
           <property name="editable">
            <bool>true</bool>
+          </property>
+          <property name="maxVisibleItems">
+           <number>25</number>
           </property>
          </widget>
         </item>
@@ -311,7 +320,7 @@
            <number>600</number>
           </property>
           <property name="orientation">
-           <enum>Qt::Horizontal</enum>
+           <enum>Qt::Orientation::Horizontal</enum>
           </property>
          </widget>
         </item>
@@ -358,7 +367,7 @@
       <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
-         <enum>Qt::Horizontal</enum>
+         <enum>Qt::Orientation::Horizontal</enum>
         </property>
         <property name="sizeHint" stdset="0">
          <size>
@@ -370,11 +379,11 @@
       </item>
       <item>
        <widget class="QPushButton" name="btnApply">
-        <property name="text">
-         <string>Apply</string>
-        </property>
         <property name="enabled">
          <bool>false</bool>
+        </property>
+        <property name="text">
+         <string>Apply</string>
         </property>
        </widget>
       </item>
