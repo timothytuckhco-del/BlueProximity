@@ -17,6 +17,7 @@ from validate import Validator
 
 try:
     import dbus
+    import dbus.bus
 except ImportError:
     print("Please install dbus-python: sudo apt-get install python3-dbus")
     sys.exit(1)
@@ -125,9 +126,19 @@ class Logger:
         else:
             self.disable_filelogging()
 
-class Proximity(threading.Thread):
+class Proximity(QObject, threading.Thread):
+    # Signals are the only thread-safe way to invoke slots across a
+    # threading.Thread → Qt main-thread boundary.
+    _sig_active    = pyqtSignal()
+    _sig_gone      = pyqtSignal()
+    _sig_proximity = pyqtSignal()
+
     def __init__(self, config):
+        QObject.__init__(self)
         threading.Thread.__init__(self, name="WorkerThread")
+        self._sig_active.connect(self.go_active)
+        self._sig_gone.connect(self.go_gone)
+        self._sig_proximity.connect(self.go_proximity)
         self.config = config
         self.Dist = -255
         self.State = "gone"
@@ -194,6 +205,24 @@ class Proximity(threading.Thread):
             pass
         self._discovery_active = False
 
+    def _is_discovering(self):
+        """Ask BlueZ whether the adapter is actually scanning right now."""
+        try:
+            props = dbus.Interface(
+                self.bus.get_object("org.bluez", self._adapter_path),
+                "org.freedesktop.DBus.Properties"
+            )
+            return bool(props.Get("org.bluez.Adapter1", "Discovering"))
+        except Exception:
+            return False
+
+    def _ensure_discovery(self):
+        """Restart discovery if BlueZ reports it has stopped (e.g. GUI scan ended)."""
+        if not self._is_discovering():
+            self.logger.log_line('discovery stopped unexpectedly — restarting')
+            self._discovery_active = False
+            self._start_discovery()
+
     def get_proximity_once(self, dev_mac):
         if not self.bus or not dev_mac:
             return -255
@@ -255,18 +284,20 @@ class Proximity(threading.Thread):
         duration_count = 0
         state = "gone"
         proxiCmdCounter = 0
-        discovery_counter = 0
+        discovery_check_counter = 0
         rssi_log_counter = 0
         last_rssi = None
 
         while not self.Stop:
             try:
-                # Restart discovery every 2 minutes to keep RSSI fresh
-                discovery_counter += 1
-                if discovery_counter >= 120 and self.bus:
-                    discovery_counter = 0
-                    self._stop_discovery()
-                    self._start_discovery()
+                # Every 10 s verify BlueZ is still discovering and restart if not.
+                # This recovers quickly from the GUI scan's StopDiscovery call which
+                # shares the same D-Bus connection and would otherwise silence RSSI
+                # updates for up to 2 minutes.
+                discovery_check_counter += 1
+                if discovery_check_counter >= 10 and self.bus:
+                    discovery_check_counter = 0
+                    self._ensure_discovery()
 
                 if self.dev_mac != "":
                     dist = self.run_cycle(self.dev_mac)
@@ -299,7 +330,7 @@ class Proximity(threading.Thread):
                             duration_count = 0
                             self.logger.log_line(f'state -> active (RSSI={dist})')
                             if not self.Simulate:
-                                QTimer.singleShot(5, self.go_active)
+                                self._sig_active.emit()
                     else:
                         duration_count = 0
                 else:
@@ -311,7 +342,7 @@ class Proximity(threading.Thread):
                             duration_count = 0
                             self.logger.log_line(f'state -> gone (RSSI={dist})')
                             if not self.Simulate:
-                                QTimer.singleShot(5, self.go_gone)
+                                self._sig_gone.emit()
                     else:
                         duration_count = 0
                         proxiCmdCounter += 1
@@ -321,7 +352,7 @@ class Proximity(threading.Thread):
 
                 if proxiCmdCounter >= int(self.config['proximity_interval']) and not self.Simulate and self.config['proximity_command']:
                     proxiCmdCounter = 0
-                    QTimer.singleShot(5, self.go_proximity)
+                    self._sig_proximity.emit()
 
                 time.sleep(1)
             except KeyboardInterrupt:
@@ -401,7 +432,11 @@ class ProximityGUI(QMainWindow):
         self._scan_model.removeRows(0, self._scan_model.rowCount())
 
         try:
-            self._scan_bus = dbus.SystemBus()
+            # Use a dedicated connection so our StopDiscovery at the end of the
+            # scan does not cancel the Proximity thread's StartDiscovery call.
+            # dbus.SystemBus() is a singleton shared with the Proximity thread;
+            # dbus.bus.BusConnection gives us a separate service name.
+            self._scan_bus = dbus.bus.BusConnection(dbus.bus.BusConnection.TYPE_SYSTEM)
             manager = dbus.Interface(
                 self._scan_bus.get_object("org.bluez", "/"),
                 "org.freedesktop.DBus.ObjectManager"
@@ -671,7 +706,7 @@ if __name__ == '__main__':
         if filename.endswith('.conf'):
             try:
                 config = ConfigObj(os.path.join(conf_dir, filename),
-                                   {'create_empty': False, 'file_error': True, 'configspec': conf_specs})
+                                   create_empty=False, file_error=True, configspec=conf_specs)
                 config.validate(vdt, copy=True)
                 config.write()
                 configs.append([filename[:-5], config])
@@ -680,7 +715,7 @@ if __name__ == '__main__':
 
     if new_config:
         config = ConfigObj(os.path.join(conf_dir, 'standard.conf'),
-                           {'create_empty': True, 'file_error': False, 'configspec': conf_specs})
+                           create_empty=True, file_error=False, configspec=conf_specs)
         config['device_mac'] = ''
         config.validate(vdt, copy=True)
         config.write()

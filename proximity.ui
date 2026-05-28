@@ -145,11 +145,17 @@
         </item>
         <item row="1" column="1">
          <widget class="QSlider" name="hscaleLockDist">
+          <property name="toolTip">
+           <string>Signal strength threshold for locking. When the device signal drops below this level for the lock duration, the screen locks. Slide right to lock sooner as you walk away.</string>
+          </property>
           <property name="maximum">
            <number>127</number>
           </property>
           <property name="orientation">
            <enum>Qt::Orientation::Horizontal</enum>
+          </property>
+          <property name="tickPosition">
+           <enum>QSlider::TickPosition::TicksBelow</enum>
           </property>
          </widget>
         </item>
@@ -162,11 +168,17 @@
         </item>
         <item row="2" column="1">
          <widget class="QSlider" name="hscaleLockDur">
+          <property name="toolTip">
+           <string>How many consecutive seconds the device must be beyond the lock distance before the screen locks. Increase to avoid accidental locks when the signal briefly dips.</string>
+          </property>
           <property name="maximum">
            <number>120</number>
           </property>
           <property name="orientation">
            <enum>Qt::Orientation::Horizontal</enum>
+          </property>
+          <property name="tickPosition">
+           <enum>QSlider::TickPosition::TicksBelow</enum>
           </property>
          </widget>
         </item>
@@ -186,11 +198,17 @@
         </item>
         <item row="4" column="1">
          <widget class="QSlider" name="hscaleUnlockDist">
+          <property name="toolTip">
+           <string>Signal strength threshold for unlocking. The device must reach at least this signal level for the unlock duration before the screen unlocks. Slide left to unlock from further away.</string>
+          </property>
           <property name="maximum">
            <number>127</number>
           </property>
           <property name="orientation">
            <enum>Qt::Orientation::Horizontal</enum>
+          </property>
+          <property name="tickPosition">
+           <enum>QSlider::TickPosition::TicksBelow</enum>
           </property>
          </widget>
         </item>
@@ -203,11 +221,17 @@
         </item>
         <item row="5" column="1">
          <widget class="QSlider" name="hscaleUnlockDur">
+          <property name="toolTip">
+           <string>How many consecutive seconds the device must be within the unlock distance before the screen unlocks. Increase to avoid accidental unlocks when you briefly pass by.</string>
+          </property>
           <property name="maximum">
            <number>120</number>
           </property>
           <property name="orientation">
            <enum>Qt::Orientation::Horizontal</enum>
+          </property>
+          <property name="tickPosition">
+           <enum>QSlider::TickPosition::TicksBelow</enum>
           </property>
          </widget>
         </item>
@@ -227,6 +251,9 @@
         </item>
         <item row="7" column="1">
          <widget class="QSlider" name="hscaleAct">
+          <property name="toolTip">
+           <string>Live signal reading — shows the current RSSI from your paired device. Slides right when the device is nearby, left when it is far away or out of range. Use this to calibrate your lock and unlock distance thresholds.</string>
+          </property>
           <property name="maximum">
            <number>127</number>
           </property>
@@ -265,6 +292,21 @@
         </item>
         <item row="10" column="1">
          <widget class="QComboBox" name="comboLock">
+          <property name="toolTip">
+           <string>Shell command to run when the screen locks. Supports any valid shell command or script path.</string>
+          </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+            <horstretch>1</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumContentsLength">
+           <number>45</number>
+          </property>
+          <property name="sizeAdjustPolicy">
+           <enum>QComboBox::SizeAdjustPolicy::AdjustToMinimumContentsLengthWithIcon</enum>
+          </property>
           <property name="editable">
            <bool>true</bool>
           </property>
@@ -282,6 +324,21 @@
         </item>
         <item row="11" column="1">
          <widget class="QComboBox" name="comboUnlock">
+          <property name="toolTip">
+           <string>Shell command to run when the screen unlocks. Supports any valid shell command or script path.</string>
+          </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+            <horstretch>1</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumContentsLength">
+           <number>45</number>
+          </property>
+          <property name="sizeAdjustPolicy">
+           <enum>QComboBox::SizeAdjustPolicy::AdjustToMinimumContentsLengthWithIcon</enum>
+          </property>
           <property name="editable">
            <bool>true</bool>
           </property>
@@ -299,6 +356,21 @@
         </item>
         <item row="12" column="1">
          <widget class="QComboBox" name="comboProxi">
+          <property name="toolTip">
+           <string>Shell command to run periodically while the device remains in proximity. Useful for keeping the screen awake or running a heartbeat script.</string>
+          </property>
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+            <horstretch>1</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="minimumContentsLength">
+           <number>45</number>
+          </property>
+          <property name="sizeAdjustPolicy">
+           <enum>QComboBox::SizeAdjustPolicy::AdjustToMinimumContentsLengthWithIcon</enum>
+          </property>
           <property name="editable">
            <bool>true</bool>
           </property>

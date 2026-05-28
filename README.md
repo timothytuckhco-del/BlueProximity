@@ -140,3 +140,7 @@ Distributed under the GNU General Public License v2. See `COPYING` for details.
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation; either version 2 of the License, or
     (at your option) any later version.
+
+    
+    
+    101            <widget class="QLineEdit" name="entryMAC"/>
