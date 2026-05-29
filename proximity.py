@@ -38,16 +38,63 @@ icon_away = 'blueproximity_nocon.svg'
 icon_error = 'blueproximity_error.svg'
 icon_pause = 'blueproximity_pause.svg'
 
+# Detect the display server so we can choose appropriate shell commands.
+# WAYLAND_DISPLAY is set by the compositor; DISPLAY is set by Xorg.
+IS_WAYLAND = bool(os.environ.get('WAYLAND_DISPLAY'))
+
+# Pre-populated suggestions shown in the command combo boxes.
+# The lock command is the same on both display servers.
+_CMD_LOCK = [
+    'loginctl lock-session',
+    'qdbus6 org.kde.screensaver /ScreenSaver org.freedesktop.ScreenSaver.Lock',
+    'xdg-screensaver lock',
+]
+
+# Wayland: loginctl unlock-session is the first thing to try.
+# qdbus6 SetActive false works on some KDE builds.
+# NOTE: KDE Plasma 6 Wayland may require PAM-based auth for a fully automatic
+# unlock — see the README for the pam_exec setup instructions.
+_CMD_UNLOCK_WAYLAND = [
+    'loginctl unlock-session',
+    'qdbus6 org.kde.screensaver /ScreenSaver org.freedesktop.ScreenSaver.SetActive false',
+    'dbus-send --session --dest=org.freedesktop.ScreenSaver /ScreenSaver '
+        'org.freedesktop.ScreenSaver.SetActive boolean:false',
+]
+_CMD_UNLOCK_X11 = [
+    'loginctl unlock-session',
+    'xdg-screensaver reset',
+    'gnome-screensaver-command --deactivate',
+]
+
+# On Wayland, keep the screen alive via SimulateUserActivity.
+# On X11, xset dpms force on works the same way.
+_CMD_PROXI_WAYLAND = [
+    'qdbus6 org.kde.screensaver /ScreenSaver '
+        'org.freedesktop.ScreenSaver.SimulateUserActivity',
+    'dbus-send --session --dest=org.freedesktop.ScreenSaver /ScreenSaver '
+        'org.freedesktop.ScreenSaver.SimulateUserActivity',
+    '',
+]
+_CMD_PROXI_X11 = [
+    'xset dpms force on',
+    'xset s reset',
+    '',
+]
+
+# Choose the right defaults for brand-new config files.
+_default_unlock_cmd  = _CMD_UNLOCK_WAYLAND[0]  if IS_WAYLAND else _CMD_UNLOCK_X11[0]
+_default_proxi_cmd   = _CMD_PROXI_WAYLAND[0]   if IS_WAYLAND else _CMD_PROXI_X11[0]
+
 conf_specs = [
     'device_mac=string(max=17,default="")',
     'device_channel=integer(1,30,default=7)',
-    'lock_distance=integer(0,127,default=7)',
+    'lock_distance=integer(0,127,default=60)',
     'lock_duration=integer(0,120,default=6)',
-    'unlock_distance=integer(0,127,default=4)',
+    'unlock_distance=integer(0,127,default=40)',
     'unlock_duration=integer(0,120,default=1)',
     'lock_command=string(default="loginctl lock-session")',
-    'unlock_command=string(default="loginctl unlock-session")',
-    'proximity_command=string(default="xset dpms force on")',
+    f'unlock_command=string(default="{_default_unlock_cmd}")',
+    f'proximity_command=string(default="{_default_proxi_cmd}")',
     'proximity_interval=integer(5,600,default=60)',
     'buffer_size=integer(1,255,default=1)',
     'log_to_syslog=boolean(default=True)',
@@ -157,9 +204,8 @@ class Proximity(QObject, threading.Thread):
         self.ignoreFirstTransition = True
         self.logger = Logger()
         self.logger.configureFromConfig(self.config)
-        self.timeAct = 0
-        self.timeGone = 0
-        self.timeProx = 0
+        # Lock protecting attributes written by the GUI thread and read by run()
+        self._state_lock = threading.Lock()
         self.bus = None
         self._adapter_path = "/org/bluez/hci0"
         self._discovery_active = False
@@ -247,73 +293,124 @@ class Proximity(QObject, threading.Thread):
             self.ErrorMsg = "Connected"
         return int(ret_val / self.ringbuffer_size)
 
+    def _run_cmd(self, label, cmd):
+        """Run a shell command and log any failure. Runs in the calling thread."""
+        if not cmd:
+            return
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                msg = f'{label} command returned {result.returncode}'
+                if result.stderr.strip():
+                    msg += f': {result.stderr.strip()}'
+                self.logger.log_line(msg)
+        except subprocess.TimeoutExpired:
+            self.logger.log_line(f'{label} command timed out after 5 s')
+        except Exception as e:
+            self.logger.log_line(f'{label} command error: {e}')
+
     def go_active(self):
         if self.ignoreFirstTransition:
             self.ignoreFirstTransition = False
         else:
             self.logger.log_line('screen is unlocked')
-            if self.timeAct == 0:
-                self.timeAct = time.time()
-                subprocess.Popen(self.config['unlock_command'], shell=True)
-                self.timeAct = 0
+            self._run_cmd('unlock', self.config['unlock_command'])
 
     def go_gone(self):
         if self.ignoreFirstTransition:
             self.ignoreFirstTransition = False
         else:
             self.logger.log_line('screen is locked')
-            if self.timeGone == 0:
-                self.timeGone = time.time()
-                subprocess.Popen(self.config['lock_command'], shell=True)
-                self.timeGone = 0
+            self._run_cmd('lock', self.config['lock_command'])
 
     def go_proximity(self):
-        if self.timeProx == 0:
-            self.timeProx = time.time()
-            subprocess.Popen(self.config['proximity_command'], shell=True)
-            self.timeProx = 0
+        # Fire-and-forget — proximity command may be long-running (e.g. a script).
+        cmd = self.config['proximity_command']
+        if cmd:
+            subprocess.Popen(cmd, shell=True)
 
     def run(self):
+        display_server = 'Wayland' if IS_WAYLAND else 'X11'
         if self.bus:
             self._adapter_path = self._find_adapter_path()
             self._start_discovery()
-            self.logger.log_line(f'started. adapter={self._adapter_path} device={self.dev_mac or "not configured"}')
+            self.logger.log_line(
+                f'started. display={display_server} adapter={self._adapter_path}'
+                f' device={self.dev_mac or "not configured"}'
+            )
         else:
-            self.logger.log_line('started. WARNING: no D-Bus connection, Bluetooth unavailable')
+            self.logger.log_line(
+                f'started. display={display_server} WARNING: no D-Bus connection, Bluetooth unavailable'
+            )
+
+        if IS_WAYLAND:
+            proxi_cmd = self.config.get('proximity_command', '')
+            if 'xset' in proxi_cmd:
+                self.logger.log_line(
+                    'WARNING: proximity_command uses xset which is X11-only. '
+                    'On Wayland use: qdbus6 org.kde.screensaver /ScreenSaver '
+                    'org.freedesktop.ScreenSaver.SimulateUserActivity'
+                )
+            self.logger.log_line(
+                'Wayland note: if loginctl unlock-session does not dismiss the '
+                'lock screen, see README for PAM-based auto-unlock setup.'
+            )
 
         duration_count = 0
         state = "gone"
         proxiCmdCounter = 0
         discovery_check_counter = 0
+        discovery_restart_counter = 0
         rssi_log_counter = 0
         last_rssi = None
 
         while not self.Stop:
             try:
-                # Every 10 s verify BlueZ is still discovering and restart if not.
-                # This recovers quickly from the GUI scan's StopDiscovery call which
-                # shares the same D-Bus connection and would otherwise silence RSSI
-                # updates for up to 2 minutes.
+                # --- Discovery maintenance ---
+                # Every 10 s: check BlueZ is still discovering and restart if not.
+                # Recovers quickly when the GUI scan's StopDiscovery kills our session.
                 discovery_check_counter += 1
                 if discovery_check_counter >= 10 and self.bus:
                     discovery_check_counter = 0
                     self._ensure_discovery()
 
-                if self.dev_mac != "":
-                    dist = self.run_cycle(self.dev_mac)
+                # Every 30 s: force a full stop+start cycle even if discovery appears
+                # to be running. This forces BlueZ to begin a fresh scan epoch so it
+                # removes the cached RSSI property for any device it no longer sees —
+                # which is the only reliable way to detect a device whose Bluetooth
+                # has been switched off (stale RSSI fix).
+                discovery_restart_counter += 1
+                if discovery_restart_counter >= 30 and self.bus:
+                    discovery_restart_counter = 0
+                    self._stop_discovery()
+                    self._start_discovery()
+
+                # --- Snapshot volatile attributes written by the GUI thread ---
+                with self._state_lock:
+                    dev_mac       = self.dev_mac
+                    gone_limit    = self.gone_limit
+                    active_limit  = self.active_limit
+                    gone_duration = self.gone_duration
+                    active_dur    = self.active_duration
+                    simulate      = self.Simulate
+
+                if dev_mac != "":
+                    dist = self.run_cycle(dev_mac)
                 else:
                     dist = -255
                     self.ErrorMsg = "No bluetooth device configured..."
 
-                # Log RSSI every 60 seconds, or immediately when it changes between found/not-found
+                # --- Logging ---
                 rssi_log_counter += 1
                 device_visible = dist != -255
                 prev_visible = last_rssi is not None and last_rssi != -255
                 if device_visible != prev_visible:
                     if device_visible:
-                        self.logger.log_line(f'device {self.dev_mac} found, RSSI={dist}')
+                        self.logger.log_line(f'device {dev_mac} found, RSSI={dist}')
                     else:
-                        self.logger.log_line(f'device {self.dev_mac} lost')
+                        self.logger.log_line(f'device {dev_mac} lost')
                 elif rssi_log_counter >= 60:
                     rssi_log_counter = 0
                     if device_visible:
@@ -322,26 +419,31 @@ class Proximity(QObject, threading.Thread):
                         self.logger.log_line(f'device not visible, state={state}')
                 last_rssi = dist
 
+                # --- State machine ---
+                # Device completely invisible (dist==-255) is always treated as gone,
+                # regardless of gone_limit, as a belt-and-suspenders guard.
+                definitely_gone = (dist == -255)
+
                 if state == "gone":
-                    if dist >= self.active_limit:
+                    if not definitely_gone and dist >= active_limit:
                         duration_count += 1
-                        if duration_count >= self.active_duration:
+                        if duration_count >= active_dur:
                             state = "active"
                             duration_count = 0
                             self.logger.log_line(f'state -> active (RSSI={dist})')
-                            if not self.Simulate:
+                            if not simulate:
                                 self._sig_active.emit()
                     else:
                         duration_count = 0
-                else:
-                    if dist <= self.gone_limit:
+                else:  # active
+                    if definitely_gone or dist <= gone_limit:
                         duration_count += 1
-                        if duration_count >= self.gone_duration:
+                        if duration_count >= gone_duration:
                             state = "gone"
                             proxiCmdCounter = 0
                             duration_count = 0
                             self.logger.log_line(f'state -> gone (RSSI={dist})')
-                            if not self.Simulate:
+                            if not simulate:
                                 self._sig_gone.emit()
                     else:
                         duration_count = 0
@@ -350,7 +452,7 @@ class Proximity(QObject, threading.Thread):
                 self.State = state
                 self.Dist = dist
 
-                if proxiCmdCounter >= int(self.config['proximity_interval']) and not self.Simulate and self.config['proximity_command']:
+                if proxiCmdCounter >= int(self.config['proximity_interval']) and not simulate and self.config['proximity_command']:
                     proxiCmdCounter = 0
                     self._sig_proximity.emit()
 
@@ -358,8 +460,18 @@ class Proximity(QObject, threading.Thread):
             except KeyboardInterrupt:
                 break
 
+        # Always attempt to stop discovery at shutdown regardless of _discovery_active
+        # flag, since a failed _start_discovery can leave the flag inconsistent.
         if self.bus:
-            self._stop_discovery()
+            try:
+                adapter = dbus.Interface(
+                    self.bus.get_object("org.bluez", self._adapter_path),
+                    "org.bluez.Adapter1"
+                )
+                adapter.StopDiscovery()
+            except dbus.exceptions.DBusException:
+                pass
+            self._discovery_active = False
 
 class ProximityGUI(QMainWindow):
     def __init__(self, configs, new_config):
@@ -378,6 +490,7 @@ class ProximityGUI(QMainWindow):
 
         self.setup_tray_icon()
         self.setup_scan_view()
+        self._populate_command_combos()   # must come before readSettings
         self.fillConfigCombo()
         self.readSettings()
 
@@ -394,6 +507,9 @@ class ProximityGUI(QMainWindow):
 
         # Apply button — enabled only when a device MAC is set and settings are dirty
         self.btnApply.clicked.connect(self.applySettings)
+
+        # Reset the live min/max RSSI tracking
+        self.btnResetMinMax.clicked.connect(self._resetMinMax)
 
         # Connect UI signals — changes mark settings dirty but do not auto-save
         self.comboConfig.currentTextChanged.connect(self.comboConfig_changed)
@@ -425,6 +541,20 @@ class ProximityGUI(QMainWindow):
         self._scan_bus = None
         self._scan_adapter = None
         self._scan_polls = 0
+
+    def _populate_command_combos(self):
+        """Fill lock/unlock/proximity combos with platform-appropriate suggestions.
+        Called once at startup; readSettings() restores the saved text on top."""
+        unlock_cmds = _CMD_UNLOCK_WAYLAND if IS_WAYLAND else _CMD_UNLOCK_X11
+        proxi_cmds  = _CMD_PROXI_WAYLAND  if IS_WAYLAND else _CMD_PROXI_X11
+        for combo, items in [
+            (self.comboLock,   _CMD_LOCK),
+            (self.comboUnlock, unlock_cmds),
+            (self.comboProxi,  proxi_cmds),
+        ]:
+            combo.clear()
+            for item in items:
+                combo.addItem(item)
 
     def scanDevices(self):
         self.btnScan.setEnabled(False)
@@ -588,14 +718,18 @@ class ProximityGUI(QMainWindow):
         if self.pauseMode:
             self.pause_action.setText("Resume")
             for conf in self.configs:
-                conf[2].lastMAC = conf[2].dev_mac
-                conf[2].dev_mac = ''
-                conf[2].Simulate = True
+                # Fix 6: acquire the lock so the worker thread never sees
+                # Simulate=True with the old dev_mac still set (or vice-versa).
+                with conf[2]._state_lock:
+                    conf[2].lastMAC = conf[2].dev_mac
+                    conf[2].dev_mac = ''
+                    conf[2].Simulate = True
         else:
             self.pause_action.setText("Pause")
             for conf in self.configs:
-                conf[2].dev_mac = getattr(conf[2], 'lastMAC', '')
-                conf[2].Simulate = False
+                with conf[2]._state_lock:
+                    conf[2].dev_mac = getattr(conf[2], 'lastMAC', '')
+                    conf[2].Simulate = False
 
     def fillConfigCombo(self):
         self.comboConfig.clear()
@@ -618,6 +752,10 @@ class ProximityGUI(QMainWindow):
             return
         has_device = bool(self.entryMAC.text().strip())
         self.btnApply.setEnabled(has_device)
+
+    def _resetMinMax(self):
+        self.minDist = -255
+        self.maxDist = 0
 
     def readSettings(self):
         was_live = self.gone_live
@@ -643,11 +781,21 @@ class ProximityGUI(QMainWindow):
         self.btnApply.setEnabled(False)
 
     def writeSettings(self):
-        self.proxi.dev_mac = self.entryMAC.text()
-        self.proxi.gone_limit = -self.hscaleLockDist.value()
-        self.proxi.gone_duration = self.hscaleLockDur.value()
-        self.proxi.active_limit = -self.hscaleUnlockDist.value()
-        self.proxi.active_duration = self.hscaleUnlockDur.value()
+        # Fix 5: hold the lock while writing multiple attributes so the worker
+        # thread never sees a half-updated snapshot (e.g. new dev_mac but old
+        # gone_limit from the previous config).
+        # Fix 9: also sync ringbuffer if buffer_size changed in the config file.
+        new_buf_size = int(self.config.get('buffer_size', 1))
+        with self.proxi._state_lock:
+            self.proxi.dev_mac = self.entryMAC.text()
+            self.proxi.gone_limit = -self.hscaleLockDist.value()
+            self.proxi.gone_duration = self.hscaleLockDur.value()
+            self.proxi.active_limit = -self.hscaleUnlockDist.value()
+            self.proxi.active_duration = self.hscaleUnlockDur.value()
+            if new_buf_size != self.proxi.ringbuffer_size:
+                self.proxi.ringbuffer_size = new_buf_size
+                self.proxi.ringbuffer = [-254] * new_buf_size
+                self.proxi.ringbuffer_pos = 0
 
         self.config['device_mac'] = self.proxi.dev_mac
         self.config['lock_distance'] = int(-self.proxi.gone_limit)
@@ -667,10 +815,28 @@ class ProximityGUI(QMainWindow):
 
     def updateState(self):
         newVal = int(self.proxi.Dist)
-        if newVal > self.minDist: self.minDist = newVal
-        if newVal < self.maxDist: self.maxDist = newVal
-        self.labState.setText(f"min: {-self.minDist} max: {-self.maxDist} state: {self.proxi.State}")
-        self.hscaleAct.setValue(-newVal)
+
+        # Fix 8: only update min/max when the device is actually visible.
+        # The sentinel value -255 ("no device") would corrupt maxDist on the
+        # very first tick (−255 < 0), permanently pinning "max: 255" in the UI.
+        if newVal != -255:
+            if newVal > self.minDist:
+                self.minDist = newVal
+            if newVal < self.maxDist:
+                self.maxDist = newVal
+
+        # Show '-' until we have at least one real reading (matches the UI default).
+        min_str = str(-self.minDist) if self.minDist != -255 else '-'
+        max_str = str(-self.maxDist) if self.maxDist != 0 else '-'
+        self.labState.setText(f"min: {min_str} max: {max_str} state: {self.proxi.State}")
+
+        # Fix 7: clamp the slider to its [0, 127] range.
+        # When dist==-255 (no device) −newVal would be 255, overflowing the max.
+        if newVal == -255:
+            slider_val = 0
+        else:
+            slider_val = max(0, min(127, -newVal))
+        self.hscaleAct.setValue(slider_val)
 
         if self.pauseMode:
             self.tray_icon.setIcon(QIcon(os.path.join(dist_path, icon_pause)))
@@ -683,7 +849,8 @@ class ProximityGUI(QMainWindow):
                 con_state = 1
             icons = [icon_base, icon_att, icon_away, icon_error]
             self.tray_icon.setIcon(QIcon(os.path.join(dist_path, icons[con_state])))
-            self.tray_icon.setToolTip(f"{self.configname}: State: {self.proxi.State}\nDist: {-newVal}\n{self.proxi.ErrorMsg}")
+            dist_display = 'N/A' if newVal == -255 else str(-newVal)
+            self.tray_icon.setToolTip(f"{self.configname}: State: {self.proxi.State}\nDist: {dist_display}\n{self.proxi.ErrorMsg}")
 
     def quit(self):
         for conf in self.configs:

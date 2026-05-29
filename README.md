@@ -99,17 +99,131 @@ Key settings:
 
 ---
 
+## Wayland support (KDE Plasma 6 / Kubuntu 26.04)
+
+Kubuntu 26.04 uses Wayland by default. BlueProximity detects this automatically
+and adjusts its default commands accordingly.
+
+### Commands that change on Wayland
+
+| Purpose | X11 command | Wayland command |
+|---------|-------------|-----------------|
+| Keep screen awake | `xset dpms force on` | `qdbus6 org.kde.screensaver /ScreenSaver org.freedesktop.ScreenSaver.SimulateUserActivity` |
+| Lock screen | `loginctl lock-session` | `loginctl lock-session` *(unchanged)* |
+| Unlock screen | `loginctl unlock-session` | see below |
+
+The proximity command dropdown in the Preferences window lists Wayland-compatible options.  
+If you have an existing config that still uses `xset`, a warning is written to the log at startup.
+
+### Unlocking on Wayland — important note
+
+Wayland's security model restricts programmatic unlocking.  
+`loginctl unlock-session` **works** in most cases — KDE's kscreenlocker listens
+for the logind `Unlock` D-Bus signal and dismisses the lock screen when it
+receives it, as long as the session was locked *via logind* (i.e. by
+BlueProximity's lock command).
+
+If you find it does not work (common when the screen was already locked by
+KDE's own idle timer before BlueProximity fired), use the PAM-based approach
+below which is the architecturally correct Wayland solution.
+
+### PAM-based auto-unlock (fully automatic on Wayland)
+
+This replaces the password prompt with a Bluetooth proximity check.
+When your phone is in range, the lock screen authenticates and dismisses itself
+without any key press.
+
+**1. Create the helper script**
+
+```bash
+sudo tee /usr/local/bin/blueproximity-pam-auth > /dev/null << 'EOF'
+#!/usr/bin/env python3
+"""
+PAM exec helper for BlueProximity.
+Returns 0 (auth success) when the configured Bluetooth device is in RSSI range.
+Reads the first *.conf found in ~/.blueproximity/.
+"""
+import os, sys, glob, dbus
+
+conf_dir = os.path.expanduser('~/.blueproximity')
+confs = glob.glob(os.path.join(conf_dir, '*.conf'))
+if not confs:
+    sys.exit(1)
+
+mac = ''
+unlock_dist = 40   # default |RSSI| threshold
+for line in open(confs[0]):
+    k, _, v = line.partition('=')
+    k, v = k.strip(), v.strip().strip('"')
+    if k == 'device_mac':
+        mac = v
+    elif k == 'unlock_distance':
+        try:
+            unlock_dist = int(v)
+        except ValueError:
+            pass
+
+if not mac:
+    sys.exit(1)
+
+try:
+    bus = dbus.SystemBus()
+    dev_path = '/org/bluez/hci0/dev_' + mac.replace(':', '_').upper()
+    props = dbus.Interface(bus.get_object('org.bluez', dev_path),
+                           'org.freedesktop.DBus.Properties')
+    rssi = int(props.Get('org.bluez.Device1', 'RSSI'))
+    # rssi is negative dBm; device is "close enough" when |rssi| < unlock_dist
+    sys.exit(0 if -rssi <= unlock_dist else 1)
+except Exception:
+    sys.exit(1)
+EOF
+sudo chmod +x /usr/local/bin/blueproximity-pam-auth
+```
+
+**2. Edit the kscreenlocker PAM config**
+
+```bash
+sudo cp /etc/pam.d/kscreenlocker /etc/pam.d/kscreenlocker.bak
+```
+
+Open `/etc/pam.d/kscreenlocker` in an editor and add this line **before** the
+existing `auth` lines:
+
+```
+auth    sufficient    pam_exec.so    /usr/local/bin/blueproximity-pam-auth
+```
+
+The `sufficient` keyword means: if the script returns 0 the entire auth stack
+succeeds immediately; if it returns 1 PAM falls through to the password prompt
+as normal.
+
+**3. Set the unlock command to a no-op**
+
+In the BlueProximity Preferences, set the **Unlocking command** to an empty
+string (or `true`). With PAM handling unlock, you do not need BlueProximity to
+call `loginctl unlock-session` — the lock screen will auto-dismiss as soon as
+the user's next interaction (or on a short polling interval configured in KDE's
+idle settings).
+
+> **Security note:** `pam_exec.so sufficient` means anyone who can write to the
+> helper script path can bypass the lock screen. Ensure
+> `/usr/local/bin/blueproximity-pam-auth` is owned by root and not
+> world-writable.
+
+---
+
 ## Logging
 
 Enable file logging on the **Proximity Details** tab. The default log path is `~/.blueproximity/blueprox.log`.
 
 The log records:
 
-- Startup (adapter path, configured device)
+- Startup (display server, adapter path, configured device)
 - Device appearing and disappearing (with RSSI)
 - RSSI and state every 60 seconds
 - State transitions (active → gone, gone → active)
-- Lock and unlock command execution
+- Lock and unlock command execution and any errors
+- Wayland-specific warnings if X11-only commands are configured
 - Clean shutdown
 
 ---
@@ -140,7 +254,3 @@ Distributed under the GNU General Public License v2. See `COPYING` for details.
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation; either version 2 of the License, or
     (at your option) any later version.
-
-    
-    
-    101            <widget class="QLineEdit" name="entryMAC"/>
